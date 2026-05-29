@@ -9,6 +9,7 @@ const KEY_VAULT = "pvault_vault_v3"; // { iv, data } — AES-GCM ciphertext of t
 // ── tunables ────────────────────────────────────────────────────────────────────
 const AUTO_LOCK_MS       = 3 * 60 * 1000; // lock after 3 min of inactivity
 const CLIPBOARD_CLEAR_MS = 20 * 1000;     // wipe copied secret after 20s
+const MIN_PASSPHRASE     = 8;             // minimum master passphrase length
 const MAX_TRIES          = 5;             // failed unlock attempts before backoff
 const LOCKOUT_MS         = 30 * 1000;     // backoff window once tries exhausted
 
@@ -17,57 +18,18 @@ function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-// ── PinDots ───────────────────────────────────────────────────────────────────
-function PinDots({ filled }) {
-  return (
-    <div style={{ display:"flex", gap:16, justifyContent:"center", marginBottom:32 }}>
-      {[0,1,2,3].map(i => (
-        <div key={i} style={{
-          width:18, height:18, borderRadius:"50%",
-          border:"2px solid #c9a84c",
-          background: i < filled ? "#c9a84c" : "transparent",
-          transition:"background 0.12s, box-shadow 0.12s",
-          boxShadow: i < filled ? "0 0 10px #c9a84c88" : "none",
-        }}/>
-      ))}
-    </div>
-  );
+// rough passphrase strength (0–4) for the meter
+function strengthScore(p) {
+  let s = 0;
+  if (p.length >= MIN_PASSPHRASE) s++;
+  if (p.length >= 14) s++;
+  if (/[a-z]/.test(p) && /[A-Z]/.test(p)) s++;
+  if (/\d/.test(p)) s++;
+  if (/[^A-Za-z0-9]/.test(p)) s++;
+  return Math.min(s, 4);
 }
-
-// ── NumPad ────────────────────────────────────────────────────────────────────
-function NumPad({ onDigit, onDelete, disabled }) {
-  const keys = ["1","2","3","4","5","6","7","8","9","","0","⌫"];
-  return (
-    <div style={{ display:"grid", gridTemplateColumns:"repeat(3,72px)", gap:14, justifyContent:"center" }}>
-      {keys.map((k, i) => {
-        if (k === "") return <div key={i}/>;
-        const isDel = k === "⌫";
-        return (
-          <button key={i} type="button" disabled={disabled}
-            onClick={() => isDel ? onDelete() : onDigit(k)}
-            onMouseDown={e => { e.currentTarget.style.transform="scale(0.93)"; }}
-            onMouseUp={e => { e.currentTarget.style.transform="scale(1)"; }}
-            onMouseLeave={e => { e.currentTarget.style.transform="scale(1)"; e.currentTarget.style.background="linear-gradient(145deg,#1c1c2e,#141420)"; e.currentTarget.style.borderColor="#2a2a3a"; }}
-            onMouseEnter={e => { if(!disabled){ e.currentTarget.style.background="linear-gradient(145deg,#252538,#1c1c2e)"; e.currentTarget.style.borderColor="#c9a84c55"; }}}
-            style={{
-              width:72, height:72, borderRadius:"50%",
-              border:"1.5px solid #2a2a3a",
-              background:"linear-gradient(145deg,#1c1c2e,#141420)",
-              color: isDel ? "#c9a84c" : "#e8d5b0",
-              fontSize: isDel ? 20 : 22,
-              fontFamily:"'JetBrains Mono',monospace", fontWeight:600,
-              cursor: disabled ? "not-allowed" : "pointer",
-              transition:"all 0.14s", outline:"none",
-              boxShadow:"0 4px 12px #00000066, inset 0 1px 0 #ffffff0a",
-              display:"flex", alignItems:"center", justifyContent:"center",
-            }}>
-            {k}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
+const STRENGTH_LABEL = ["Too short", "Weak", "Fair", "Good", "Strong"];
+const STRENGTH_COLOR = ["#ff5555", "#ff8855", "#e0b84c", "#9acc5a", "#5acc88"];
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 const EyeOpen = () => (
@@ -141,10 +103,12 @@ const GLOBAL_CSS = `
 export default function PasswordVault() {
   // Modes: loading | setup | confirm | locked | unlocked
   const [mode, setMode]           = useState("loading");
-  const [pinInput, setPinInput]   = useState("");
-  const [tempPin, setTempPin]     = useState("");
-  const [pinError, setPinError]   = useState("");
+  const [phrase, setPhrase]       = useState("");   // current passphrase field value
+  const [tempPhrase, setTempPhrase] = useState(""); // first entry during setup
+  const [showPhrase, setShowPhrase] = useState(false);
+  const [phraseError, setPhraseError] = useState("");
   const [shaking, setShaking]     = useState(false);
+  const [busy, setBusy]           = useState(false); // key derivation in progress
   const [tries, setTries]         = useState(0);
   const [lockedUntil, setLockedUntil] = useState(0);
 
@@ -157,17 +121,12 @@ export default function PasswordVault() {
   const [newEntry, setNewEntry]   = useState({ service:"", username:"", password:"" });
   const [revealNew, setRevealNew] = useState(false);
   const [booting, setBooting]     = useState(true);
-  const [hasVault, setHasVault]   = useState(false);
 
-  // refs so async / timer callbacks always read current values (no stale closures)
-  const modeRef     = useRef(mode);
-  const tempPinRef  = useRef(tempPin);
-  const saltRef     = useRef(null);     // base64 salt loaded/created for this vault
-  const keyRef      = useRef(null);     // in-memory CryptoKey for the unlocked session
-  const lockTimer   = useRef(null);     // inactivity auto-lock timer
-  const clipTimer   = useRef(null);     // clipboard-clear timer
-  useEffect(() => { modeRef.current = mode; }, [mode]);
-  useEffect(() => { tempPinRef.current = tempPin; }, [tempPin]);
+  // refs for async / timer callbacks
+  const saltRef     = useRef(null);  // base64 salt for this vault
+  const keyRef      = useRef(null);  // in-memory CryptoKey for the unlocked session
+  const lockTimer   = useRef(null);
+  const clipTimer   = useRef(null);
 
   // ─── init ────────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -176,7 +135,6 @@ export default function PasswordVault() {
       const vault = await sGet(KEY_VAULT);
       if (salt && vault) {
         saltRef.current = salt;
-        setHasVault(true);
         setMode("locked");
       } else {
         setMode("setup");
@@ -185,130 +143,114 @@ export default function PasswordVault() {
     })();
   }, []);
 
-  // ─── shake helper ────────────────────────────────────────────────────────────
+  // ─── helpers ────────────────────────────────────────────────────────────────
   function shake(msg) {
     setShaking(true);
-    setPinError(msg);
+    setPhraseError(msg);
     setTimeout(() => setShaking(false), 550);
-    setTimeout(() => setPinError(""), 2200);
+    setTimeout(() => setPhraseError(""), 2600);
   }
 
-  // ─── lock the vault and wipe the in-memory key ───────────────────────────────
   const handleLock = useCallback(() => {
     keyRef.current = null;
     setPasswords([]);
     setMode("locked");
-    setPinInput("");
+    setPhrase("");
+    setTempPhrase("");
+    setShowPhrase(false);
     setRevealed({});
     setShowAdd(false);
     setSearch("");
     setAskDel(null);
-    setPinError("");
+    setPhraseError("");
   }, []);
 
-  // ─── persist current entries (re-encrypt with the session key) ────────────────
   async function persist(entries) {
     if (!keyRef.current) return;
     const payload = await encryptJSON(keyRef.current, entries);
     await sSet(KEY_VAULT, payload);
   }
 
-  // ─── process a completed 4-digit pin ─────────────────────────────────────────
-  async function processPin(code) {
-    const m = modeRef.current;
+  // ─── submit the passphrase for the current mode ──────────────────────────────
+  async function submitPhrase() {
+    if (busy || shaking) return;
+    const value = phrase;
 
-    if (m === "setup") {
-      setTempPin(code);
-      setPinInput("");
+    if (mode === "setup") {
+      if (value.length < MIN_PASSPHRASE) {
+        shake(`Use at least ${MIN_PASSPHRASE} characters`);
+        return;
+      }
+      setTempPhrase(value);
+      setPhrase("");
+      setShowPhrase(false);
       setMode("confirm");
       return;
     }
 
-    if (m === "confirm") {
-      if (code === tempPinRef.current) {
+    if (mode === "confirm") {
+      if (value !== tempPhrase) {
+        shake("Passphrases don't match — start over");
+        setTimeout(() => {
+          setPhrase("");
+          setTempPhrase("");
+          setMode("setup");
+        }, 700);
+        return;
+      }
+      setBusy(true);
+      try {
         const salt = newSalt();
-        const key  = await deriveKey(code, salt);
+        const key  = await deriveKey(value, salt);
         saltRef.current = salt;
         keyRef.current  = key;
         const payload = await encryptJSON(key, []);
         await sSet(KEY_SALT, salt);
         await sSet(KEY_VAULT, payload);
-        setHasVault(true);
         setPasswords([]);
-        setTempPin("");
-        setPinInput("");
+        setPhrase("");
+        setTempPhrase("");
         setMode("unlocked");
-      } else {
-        shake("PINs don't match — try again");
-        setTimeout(() => {
-          setPinInput("");
-          setTempPin("");
-          setMode("setup");
-        }, 600);
+      } finally {
+        setBusy(false);
       }
       return;
     }
 
-    if (m === "locked") {
+    if (mode === "locked") {
       if (Date.now() < lockedUntil) {
         shake("Too many attempts — wait a moment");
-        setTimeout(() => setPinInput(""), 600);
         return;
       }
+      if (!value) return;
+      setBusy(true);
       try {
-        const key = await deriveKey(code, saltRef.current);
+        const key = await deriveKey(value, saltRef.current);
         const vault = await sGet(KEY_VAULT);
-        const entries = await decryptJSON(key, vault); // throws if PIN is wrong
+        const entries = await decryptJSON(key, vault); // throws on wrong passphrase
         keyRef.current = key;
         setPasswords(Array.isArray(entries) ? entries : []);
         setTries(0);
-        setPinInput("");
-        setPinError("");
+        setPhrase("");
+        setShowPhrase(false);
+        setPhraseError("");
         setMode("unlocked");
       } catch {
         const next = tries + 1;
         setTries(next);
+        setPhrase("");
         if (next >= MAX_TRIES) {
           setLockedUntil(Date.now() + LOCKOUT_MS);
           setTries(0);
           shake("Too many attempts — locked for 30s");
         } else {
-          shake(`Incorrect PIN (${MAX_TRIES - next} left)`);
+          shake(`Incorrect passphrase (${MAX_TRIES - next} left)`);
         }
-        setTimeout(() => setPinInput(""), 600);
+      } finally {
+        setBusy(false);
       }
     }
   }
-
-  // ─── digit / backspace ───────────────────────────────────────────────────────
-  const handleDigit = useCallback((d) => {
-    if (shaking) return;
-    setPinInput(prev => {
-      if (prev.length >= 4) return prev;
-      const next = prev + d;
-      if (next.length === 4) setTimeout(() => processPin(next), 120);
-      return next;
-    });
-    setPinError("");
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [shaking]);
-
-  const handleBackspace = useCallback(() => {
-    if (shaking) return;
-    setPinInput(p => p.slice(0, -1));
-    setPinError("");
-  }, [shaking]);
-
-  // ─── physical keyboard support on the PIN screen ─────────────────────────────
-  useEffect(() => {
-    if (mode === "unlocked" || mode === "loading") return;
-    function onKey(e) {
-      if (e.key >= "0" && e.key <= "9") { e.preventDefault(); handleDigit(e.key); }
-      else if (e.key === "Backspace")   { e.preventDefault(); handleBackspace(); }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [mode, handleDigit, handleBackspace]);
 
   // ─── inactivity auto-lock (only while unlocked) ──────────────────────────────
   useEffect(() => {
@@ -326,7 +268,7 @@ export default function PasswordVault() {
     };
   }, [mode, handleLock]);
 
-  // ─── lock when the window/tab loses focus or is hidden ───────────────────────
+  // ─── lock when window/tab hidden ─────────────────────────────────────────────
   useEffect(() => {
     if (mode !== "unlocked") return;
     const onHide = () => { if (document.hidden) handleLock(); };
@@ -334,7 +276,6 @@ export default function PasswordVault() {
     return () => document.removeEventListener("visibilitychange", onHide);
   }, [mode, handleLock]);
 
-  // ─── clear any pending clipboard timer on unmount ────────────────────────────
   useEffect(() => () => { if (clipTimer.current) clearTimeout(clipTimer.current); }, []);
 
   // ─── vault actions ───────────────────────────────────────────────────────────
@@ -362,7 +303,6 @@ export default function PasswordVault() {
     navigator.clipboard?.writeText(text).catch(()=>{});
     setCopied(key);
     setTimeout(() => setCopied(null), 1800);
-    // auto-wipe the secret from the OS clipboard after a short delay
     if (clipTimer.current) clearTimeout(clipTimer.current);
     clipTimer.current = setTimeout(() => {
       navigator.clipboard?.writeText("").catch(()=>{});
@@ -386,12 +326,15 @@ export default function PasswordVault() {
     </div>
   );
 
-  // ── RENDER: PIN SCREEN (setup | confirm | locked) ────────────────────────────
+  // ── RENDER: PASSPHRASE SCREEN (setup | confirm | locked) ─────────────────────
   if (mode !== "unlocked") {
-    const title    = mode==="setup" ? "Create PIN" : mode==="confirm" ? "Confirm PIN" : "Vault Locked";
-    const subtitle = mode==="setup" ? "Choose a 4-digit PIN to protect your vault"
-                   : mode==="confirm" ? "Re-enter your PIN to confirm"
-                   : "Enter your PIN to continue";
+    const title    = mode==="setup" ? "Create Passphrase" : mode==="confirm" ? "Confirm Passphrase" : "Vault Locked";
+    const subtitle = mode==="setup" ? "Choose a strong master passphrase to protect your vault"
+                   : mode==="confirm" ? "Re-enter your passphrase to confirm"
+                   : "Enter your master passphrase to continue";
+    const cta = mode==="setup" ? "Continue" : mode==="confirm" ? "Create Vault" : "Unlock";
+    const score = strengthScore(phrase);
+    const canSubmit = !busy && (mode==="setup" ? phrase.length >= MIN_PASSPHRASE : phrase.length > 0);
 
     return (
       <div style={S.root}>
@@ -402,13 +345,59 @@ export default function PasswordVault() {
           <h2 style={S.pinTitle}>{title}</h2>
           <p style={S.pinSub}>{subtitle}</p>
 
-          <PinDots filled={pinInput.length}/>
+          <div style={{ position:"relative", marginBottom: 10 }}>
+            <input
+              type={showPhrase ? "text" : "password"}
+              value={phrase}
+              autoFocus
+              autoComplete={mode==="locked" ? "current-password" : "new-password"}
+              disabled={busy}
+              onChange={e=>setPhrase(e.target.value)}
+              onKeyDown={e=>{ if (e.key === "Enter" && canSubmit) submitPhrase(); }}
+              placeholder={mode==="locked" ? "Master passphrase" : "Enter a passphrase"}
+              style={{ ...S.input, textAlign:"center", letterSpacing: showPhrase ? "normal" : "0.18em", paddingRight:42, height:46, fontSize:15 }}
+            />
+            <button type="button" onClick={()=>setShowPhrase(s=>!s)} style={S.eyeBtn} tabIndex={-1}>
+              {showPhrase ? <EyeOpen/> : <EyeClosed/>}
+            </button>
+          </div>
 
-          {pinError
-            ? <p style={S.errMsg}>{pinError}</p>
+          {/* strength meter — only while creating */}
+          {mode==="setup" && (
+            <div style={{ height:18, marginBottom:8 }}>
+              {phrase.length > 0 && (
+                <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                  <div style={{ flex:1, display:"flex", gap:4 }}>
+                    {[0,1,2,3].map(i => (
+                      <div key={i} style={{
+                        flex:1, height:4, borderRadius:2,
+                        background: i < score ? STRENGTH_COLOR[score] : "#1e1e2e",
+                        transition:"background 0.2s",
+                      }}/>
+                    ))}
+                  </div>
+                  <span style={{ fontSize:9, color: STRENGTH_COLOR[score], letterSpacing:"0.08em", minWidth:54, textAlign:"right" }}>
+                    {STRENGTH_LABEL[score]}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {phraseError
+            ? <p style={S.errMsg}>{phraseError}</p>
             : <p style={{ ...S.errMsg, opacity:0, userSelect:"none" }}>_</p>}
 
-          <NumPad onDigit={handleDigit} onDelete={handleBackspace} disabled={shaking}/>
+          <button type="button" onClick={submitPhrase} disabled={!canSubmit}
+            style={{ ...S.unlockBtn, opacity: canSubmit ? 1 : 0.45, cursor: canSubmit ? "pointer" : "not-allowed" }}>
+            {busy ? "Working…" : cta}
+          </button>
+
+          {mode==="setup" && (
+            <p style={S.warnNote}>
+              There's no recovery — if you forget this passphrase, the vault can't be opened.
+            </p>
+          )}
         </div>
       </div>
     );
@@ -612,8 +601,8 @@ const S = {
   pinCard: {
     background:"linear-gradient(160deg,#111120,#0d0d1a)",
     border:"1px solid #1c1c2c",
-    borderRadius:24, padding:"38px 48px 44px",
-    width:336, textAlign:"center",
+    borderRadius:24, padding:"38px 40px 36px",
+    width:360, textAlign:"center",
     boxShadow:"0 32px 80px #00000099, inset 0 1px 0 #ffffff07",
   },
   emblem: {
@@ -633,10 +622,22 @@ const S = {
     fontFamily:"'Playfair Display',serif", fontSize:22, fontWeight:700,
     color:"#e8d5b0", marginBottom:6, letterSpacing:"-0.01em",
   },
-  pinSub: { fontSize:11, color:"#4a4a6a", lineHeight:1.5, marginBottom:28 },
+  pinSub: { fontSize:11, color:"#4a4a6a", lineHeight:1.5, marginBottom:24 },
   errMsg: {
     color:"#ff6b6b", fontSize:11, height:16,
-    lineHeight:"16px", marginBottom:18, animation:"slideDown 0.2s ease",
+    lineHeight:"16px", marginBottom:14, animation:"slideDown 0.2s ease",
+  },
+  unlockBtn: {
+    width:"100%",
+    background:"linear-gradient(135deg,#c9a84c,#a8863c)",
+    color:"#0a0a0f", border:"none", borderRadius:10,
+    padding:"12px 0", fontSize:13, fontWeight:700,
+    fontFamily:"'JetBrains Mono',monospace",
+    boxShadow:"0 4px 16px #c9a84c2e", transition:"opacity 0.15s",
+  },
+  warnNote: {
+    fontSize:10, color:"#5a5a4a", lineHeight:1.5, marginTop:16,
+    fontFamily:"'JetBrains Mono',monospace",
   },
   header: {
     width:"100%", padding:"14px 24px",
